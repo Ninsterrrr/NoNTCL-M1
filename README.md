@@ -1,9 +1,10 @@
 # NoNTCL: EchoInject
 
 > **⚠️项目状态：开发中（Pre-release）**
-
-> 本项目目前在 GitHub 仅作为技术预览与源码仓库预留位，**尚未在 Steam 上架**。
-
+> 
+> 本项目目前在 GitHub 仅作为技术预览与源码仓库预留位，**尚未在 Steam 上架**。请勿将当前代码视为最终发行版。
+> 
+> D3D12 计算管线 · 硬件级光流诊断 · Sub-pixel 帧插值 · 纯 Shader 合成 UI  
 > 源码可见，非商业许可。合法安装包仅限 Valve Corporation 运营的 Steam 平台。
 
 ---
@@ -19,47 +20,47 @@
 
 ### 技术栈
 
-- **图形 API**：DirectX 12（D3D_FEATURE_LEVEL_11_0 设备，D3D12 命令队列 / 分配器 / 围栏）
-- **捕获**：Windows Graphics Capture（WGC）+ D3D11On12 互操作，支持**动态实时窗口捕获**与**自定义目标选择**
+- **图形 API**：DirectX 12（D3D_FEATURE_LEVEL_11_0，双缓冲命令分配器，Fence 同步）
+- **捕获**：Windows Graphics Capture（WGC）+ D3D11On12 互操作，支持**运行时动态切换捕获目标**与异常回滚
 - **计算管线**：Compute Shader（cs_5_0），4 个 PSO：Down / Coarse / Upsample / Final
-- **渲染管线**：Graphics Pipeline（vs_5_0 / ps_5_0），全屏三角形绘制，无顶点缓冲
-- **UI 渲染**：纯 Shader 绘制的控制中心界面，无传统 UI 框架（无 ImGui、无 Qt）
-- **资源格式**：`B8G8R8A8_UNORM` 纹理，`R16G16_FLOAT` 光流场
-- **同步**：D3D12 Resource Barrier 状态跟踪，逐资源 `D3D12_RESOURCE_STATES` 显式管理；**帧同步与极低延迟架构**（类 OBS 的纯动态实时捕获）
-- **交换链**：`DXGI_SWAP_EFFECT_FLIP_DISCARD`，双缓冲，`DXGI_SCALING_STRETCH`
+- **渲染管线**：Graphics Pipeline（vs_5_0 / ps_5_0），全屏三角形（`SV_VertexID`）无顶点缓冲渲染
+- **UI 渲染**：纯 Shader 绘制的 Overlay 管线（无 ImGui / Qt），采用 SDF（Signed Distance Field）绘制圆角面板与内置点阵字体，独立的 Alpha Blend 状态
+- **资源格式**：`B8G8R8A8_UNORM` 纹理，`R16G16_FLOAT` 光流场，`RWStructuredBuffer` 诊断数据
+- **同步**：D3D12 Resource Barrier 状态跟踪；多帧飞行（In-flight）Fence 同步；UAV Barrier 隔离诊断缓冲
+- **低延迟架构**：事件驱动 + 帧同步，CPU 侧 `WaitQueueIdle` 确保捕获切换安全，最大化消除输入延迟
 
 ### 架构概览
 
-- **捕获层**：WGC 通过 `Direct3D11CaptureFramePool` 抓取目标窗口，帧到达回调把 `ID3D11Texture2D` 推入队列；`GrabFrame()` 取最新帧，经 `D3D11On12` 的 `AcquireWrappedResources` / `CopySubresourceRegion` / `ReleaseWrappedResources` 拷入 D3D12 共享纹理。**支持用户自由选择捕获目标窗口，实时动态响应窗口大小与焦点变化。**
-- **输入层**：`UpdateFromWGC` 把捕获纹理 `CopyTextureRegion` 写入 `texA`，同时把上一帧的 `texHistory` 拷到 `texB`，再把当前帧写入 `texHistory`，形成 A/B 两帧输入。
-- **计算层**：`RecordComputePasses` 依次调度四个 Compute PSO——Down（2x 下采样，A/B 各一份半分辨率）、Coarse（半分辨率 3x3 块匹配，初始光流）、Upsample（2x 上采样光流到全分辨率）、Final（全分辨率 5x5 精细匹配 + 双向平均）。
-- **渲染层**：`RecordDrawPass` 用全屏三角形（`SV_VertexID` 生成，无顶点缓冲）采样 `outTex`，经 Root Signature 的 SRV 描述符表 + 静态 Sampler，写入交换链后缓冲并 Present。
-- **UI 层**：控制中心面板完全由 Shader 绘制，直接在交换链上合成仪表盘、状态灯、处理模式、运动状态等控件，不依赖系统或第三方 UI 框架。
-- **同步**：每帧 `WaitFence(frameFence[cur])` 等待该后缓冲上一帧完成，双缓冲围栏值数组，Present 后 Signal 新围栏值。
-- **资源**：全分辨率 `texA` / `texB` / `texHistory` / `outTex`；半分辨率 `texA_half` / `texB_half` / `flowHalf`；全分辨率光流 `flowFull`。描述符堆为单个 `CBV_SRV_UAV` 堆，14 个描述符，按 Down / Coarse / Upsample / Final 四段分配 GPU 句柄。
+- **控制层**：独立的控制中心窗口（`NEIControl`），提供仪表盘、设置页、窗口选择器。支持动态切换语言、枚举可见窗口，内部维护独立 SwapChain 与光栅化 UI 渲染。
+- **捕获层**：`WGCCapture` 使用 `Direct3D11CaptureFramePool` 异步抓取，帧到达时回调。`GrabFrame` 返回标记 `hasNewFrame` 的 D3D12 共享纹理。**支持在帧循环中动态响应控制中心的切换请求，包含失败回滚（Rollback）与降级抓取自身窗口逻辑**。
+- **输入层**：`UpdateFromWGC` 维护 `texA`（当前帧）、`texB`（历史帧）、`texHistory`（帧池）。处理首帧初始化（A/B 同源）与后续帧的 A/B 交替。
+- **计算层**：`RecordComputePasses` 进行金字塔光流调度。**新增硬件诊断**：Final Pass 使用 `groupshared` 内存进行 Group 内归约，将图像亮度差、光流幅度、接受率等指标写入 `m_diagPartial`；每 30 帧通过 Readback Buffer 异步拷贝回 CPU 打印。
+- **渲染与 UI 层**：`RecordDrawPass` 先绘制视频后缓冲（`m_psoDraw`），再基于 `m_uiState` 绘制 UI（`m_psoUI`）。UI 完全由数学函数（如 `smoothstep` 算距离场）和位运算（`GlyphBits` 查表）在 Shader 内实时生成，实现了类 OBS 的沉浸式状态叠加。
 
 ### 核心算法
 
-- **2 级金字塔光流**：半分辨率粗匹配（±1 搜索窗，3x3）→ 上采样 ×2 → 全分辨率精细匹配（±2 搜索窗，5x5，以粗流为基点）。
-- **块匹配代价**：RGB 三通道绝对差之和（SAD），取最小代价偏移。
-- **双向平均**：Final pass 取 `(cA + cB) * 0.5`，cB 为按光流偏移采样后的 B 帧像素。
-- **状态屏障切换**：`Barrier()` 封装 `D3D12_RESOURCE_BARRIER_TYPE_TRANSITION`，逐资源跟踪当前状态，相同状态跳过，避免冗余屏障。
+- **2 级金字塔光流**：半分辨率 3x3 粗匹配 → 上采样 ×2 → 全分辨率 5x5 精细匹配。
+- **亚像素插值（Sub-pixel）**：Final pass 引入 `SampleLinear`，通过 `floor` / `frac` 与四次 `Load` 手动实现双线性插值采样，解决整数光流的锯齿。
+- **置信度评估与自适应融合**：
+  - 计算 `improvementConfidence`：通过对比零向量（无偏移）与最佳匹配的 Cost 改善率。
+  - 计算 `matchConfidence`：根据最小 Cost 的绝对值评估匹配可靠性。
+  - 最终 `flow = float2(bestM) * (improvementConfidence * matchConfidence)`，确保高置信度才插帧，低置信度平滑衰减。
+- **状态屏障切换**：`Barrier()` 封装并跟踪每张纹理的状态，跳过相同状态的冗余屏障；在读写 `StructuredBuffer` 前插入 `UAV_BARRIER`。
 
 ### 性能特征
 
-- 目标分辨率：**待测试**
-- 帧率提升区间（原生 → 插帧后）：**待测试**
-- 显存占用：**待测试**
-- 端到端延迟：**极低延迟（当前测试版本感知延迟约1-50ms，取决于硬件动荡，纯动态捕获）**
-- 适用内容类型：**待测试**
+- 目标分辨率：**待填**
+- 帧率提升区间（原生 → 插帧后）：**待填**
+- 显存占用：**当前≤0.2G**
+- 内存占用：**当前≤0.5G**
+- 端到端延迟：**事件驱动捕获 + 硬件插值合成，延迟取决于硬件，约 1-50ms**
+- 适用内容类型：**待填**
 
 ### 已知限制
 
-- 光流搜索窗固定为 ±1（粗）/ ±2（精），大幅运动可能匹配失败。
-- 块匹配为整数像素精度，无亚像素插值。
-- Final pass 为简单双向平均，无遮挡检测、无一致性校验。
-- 当前为单帧前向 + 历史帧的 2 帧输入，未做多帧时序累积。
+- WGC 捕获层级限制：某些全屏独占（Fullscreen Exclusive）游戏或受 DRM 保护的窗口无法被捕获。
 - **反作弊兼容性**：已测试使用 WGC 纯捕获目标窗口（如 VRChat）不会触发 Easy Anti-Cheat（小蓝熊）拦截；**但插入插帧处理流程后是否会被反作弊拦截尚未完成完整测试**，需注意游戏内使用风险。
+- 控制中心 UI 依赖 `GDI` 绘制字体并上传为 D3D12 纹理，分辨率缩放依赖操作系统的 DPI 缩放机制。
 
 ---
 
@@ -95,7 +96,7 @@
 
 **以下行为同样不受本条限制**：以本软件为对象制作评测、教程、演示、技术分析等内容并公开发布，即使该内容带有平台激励、广告或赞助。
 
-商业授权申请（仅针对源码或自行编译产物的商业使用）请发送至：**先不告诉你~@qq.com**，并附公司名称、预期用途及预算。版权人应在收到完整申请信息后 14 个自然日内回复。未在期限内回复不构成默示授权。
+商业授权申请（仅针对源码或自行编译产物的商业使用）请发送至：**xxxxxxxxx@qq.com**，并附公司名称、预期用途及预算。版权人应在收到完整申请信息后 14 个自然日内回复。未在期限内回复不构成默示授权。
 
 ### 3. AI 训练禁令（AI Training Prohibition）
 
